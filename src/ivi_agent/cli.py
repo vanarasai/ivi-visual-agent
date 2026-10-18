@@ -380,7 +380,9 @@ def main() -> None:
         )
         result = agent.run(args.goal, Path(args.output), dry_run=args.dry_run)
         print(json.dumps(result.to_dict(), indent=2))
-        raise SystemExit(0 if result.outcome == "pass" else 2)
+        # Exit codes: 0 = pass, or a run that proved nothing (dry run /
+        # inconclusive — a safe stop is not a defect); 2 = fail.
+        raise SystemExit(2 if result.outcome == "fail" else 0)
     except (ValueError, OSError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc

@@ -350,6 +350,10 @@ class GoalAgent:
         # to result.grounding by reference, so phases timed after that (logcat)
         # still appear.
         phase_seconds: dict[str, float] = {}
+        # Fatal events already in the buffer before the run started. `logcat -c`
+        # is best-effort and can fail, so pre-existing crashes must not be
+        # attributed to this run (they would fail it for someone else's defect).
+        logcat_baseline: set[tuple[str, str]] = set()
 
         def _add_phase(name: str, started_at: float) -> None:
             phase_seconds[name] = round(
@@ -367,6 +371,16 @@ class GoalAgent:
             self.device.ensure_ready()
             self.device.wake_if_needed()
             if getattr(self.config, "capture_logs", True):
+                try:
+                    for event in scan_crashes(
+                        self.device.logcat_dump(
+                            getattr(self.config, "log_tail_lines", 4000)
+                        ),
+                        self.config.target_package or None,
+                    ):
+                        logcat_baseline.add((event.kind, event.package))
+                except Exception:  # noqa: BLE001 - baseline is advisory
+                    pass
                 self.device.clear_logcat()
             # Clean-start hygiene: relaunch the app cold so the run begins from a
             # known state rather than whatever a previous run left behind. Done
@@ -1147,9 +1161,13 @@ class GoalAgent:
                             )
                         except Exception:  # noqa: BLE001
                             pass
-                        events = scan_crashes(
-                            logcat_text, self.config.target_package or None
-                        )
+                        events = [
+                            event
+                            for event in scan_crashes(
+                                logcat_text, self.config.target_package or None
+                            )
+                            if (event.kind, event.package) not in logcat_baseline
+                        ]
                         result.crashes = crash_summary(events)
                         for event in events:
                             trace.event(

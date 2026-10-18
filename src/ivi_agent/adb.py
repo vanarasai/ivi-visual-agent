@@ -21,6 +21,9 @@ class AdbDevice:
         # that screencap can't use directly on multi-display emulators, so it is
         # mapped to a physical display id in capture_display_id().
         self._resolved_capture_display_id: int | None = None
+        # App-name -> package resolution cache (see resolve_package). Filled on
+        # first use so a run pays for the device query once, not per action.
+        self._package_cache: list[str] | None = None
 
     def _base(self) -> list[str]:
         command = ["adb"]
@@ -227,23 +230,139 @@ class AdbDevice:
     def type_text(self, text: str) -> None:
         self._run("shell", "input", "text", self._escape_input_text(text))
 
+    _PACKAGE_RE = re.compile(r"[A-Za-z][\w]*(?:\.[A-Za-z0-9_]+)+")
+
+    def _launcher_packages(self) -> list[str]:
+        """Package ids exposing a launcher activity, cached per device object.
+
+        One `cmd package query-activities` round-trip per run instead of one per
+        open_app action. Returns [] when the device cannot answer, so callers
+        fall back to the strict package-id gate.
+        """
+        if self._package_cache is None:
+            packages: list[str] = []
+            try:
+                raw = str(
+                    self._run(
+                        "shell",
+                        "cmd",
+                        "package",
+                        "query-activities",
+                        "--brief",
+                        "-a",
+                        "android.intent.action.MAIN",
+                        "-c",
+                        "android.intent.category.LAUNCHER",
+                        timeout=15,
+                    )
+                )
+                for line in raw.splitlines():
+                    line = line.strip()
+                    if "/" not in line:
+                        continue
+                    package = line.split("/", 1)[0].strip()
+                    if package and package not in packages:
+                        packages.append(package)
+            except AdbError:
+                packages = []
+            self._package_cache = packages
+        return self._package_cache
+
     @staticmethod
-    def _require_package(app_name: str) -> str:
-        package = app_name.strip()
-        if not re.fullmatch(r"[A-Za-z][\w]*(?:\.[A-Za-z0-9_]+)+", package):
+    def _label_tokens(text: str) -> list[str]:
+        """Lowercase word tokens of a label ('Car Settings' -> ['car','settings'])."""
+        return [token for token in re.split(r"[^a-z0-9]+", text.lower()) if token]
+
+    def resolve_package(self, app_name: str) -> str:
+        """Resolve a human app label to an installed package id.
+
+        The model proposes labels ("Car Settings"), not package ids, so a strict
+        package-id gate rejects every realistic open_app. Resolution order:
+          1. an exact package id (com.android.car.settings) passes straight through;
+          2. a label match against installed launcher packages, where every token
+             of the label must appear in the package id's own segments.
+        Ambiguity is an error, not a guess: equally good candidates raise.
+        """
+        candidate = app_name.strip()
+        if not candidate:
+            raise AdbError("open_app needs an app name or package id")
+        if self._PACKAGE_RE.fullmatch(candidate):
+            return candidate
+        tokens = self._label_tokens(candidate)
+        if not tokens:
+            raise AdbError(f"Cannot resolve app name to a package: {app_name!r}.")
+        scored: list[tuple[int, int, str]] = []
+        for package in self._launcher_packages():
+            segments = self._label_tokens(package)
+            if all(any(token in segment for segment in segments) for token in tokens):
+                # Prefer more matched tokens, then the shorter (more specific) id.
+                scored.append((len(tokens), -len(package), package))
+        if not scored:
             raise AdbError(
                 f"Cannot resolve app name to a package: {app_name!r}. "
-                "Provide a package id (e.g. com.android.settings) or tap the launcher."
+                "No installed launcher package matches that label; provide a "
+                "package id (e.g. com.android.settings) or tap the launcher."
             )
-        return package
+        scored.sort(reverse=True)
+        best = scored[0]
+        rivals = sorted({pkg for score in scored[1:] if score[:2] == best[:2] for pkg in [score[2]]})
+        if rivals:
+            raise AdbError(
+                f"Ambiguous app name {app_name!r}: matches "
+                + ", ".join(sorted([best[2], *rivals]))
+                + ". Provide a package id."
+            )
+        return best[2]
+
+    def _require_package(self, app_name: str) -> str:
+        return self.resolve_package(app_name)
+
+    def _launcher_activity(self, package: str) -> str | None:
+        """Return 'pkg/activity' for a package's launcher activity, or None.
+
+        `monkey -p` is the traditional launcher, but it exits non-zero (251) on
+        automotive AVDs even when the app is installed and launchable, so the
+        explicit component from resolve-activity is the primary path.
+        """
+        try:
+            raw = str(
+                self._run(
+                    "shell",
+                    "cmd",
+                    "package",
+                    "resolve-activity",
+                    "--brief",
+                    "-a",
+                    "android.intent.action.MAIN",
+                    "-c",
+                    "android.intent.category.LAUNCHER",
+                    package,
+                    timeout=15,
+                )
+            )
+        except AdbError:
+            return None
+        for line in raw.splitlines():
+            line = line.strip()
+            if "/" in line and line.split("/", 1)[0] == package:
+                return line
+        return None
 
     def open_app(self, app_name: str) -> None:
-        """Best-effort launch by package name for the standalone agent.
+        """Launch an app by human label or package id.
 
         The AndroidWorld adapter never calls this; it delegates open_app to the
         benchmark environment, which resolves human app names to packages.
         """
         package = self._require_package(app_name)
+        activity = self._launcher_activity(package)
+        if activity:
+            try:
+                self._run("shell", "am", "start", "-W", "-n", activity, timeout=30)
+                time.sleep(1.0)
+                return
+            except AdbError:
+                pass  # fall through to monkey
         self._run("shell", "monkey", "-p", package, "-c", "android.intent.category.LAUNCHER", "1")
         time.sleep(1.0)
 
